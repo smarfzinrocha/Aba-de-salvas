@@ -1,0 +1,782 @@
+-- [[ ABYSS DIE - APENAS ABA EXTRAS (Robô + Martelo) ]]
+-- Execute DEPOIS do DIE v6
+-- Só injeta a aba PUBLICO / Extras na "tela" do DIE
+-- Versão isolada para usar junto com outras abas melhores
+
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+local RS = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ====================== ENCONTRAR DIE ======================
+local dieGui = CoreGui:WaitForChild("DIE_Interface", 10)
+if not dieGui then
+	warn("DIE não encontrado! Execute o DIE primeiro.")
+	return
+end
+
+local base = dieGui:WaitForChild("Base principal")
+local tela = base:WaitForChild("tela")
+tela.ClipsDescendants = true
+
+-- Limpa qualquer conteúdo antigo da tela
+-- Não apaga outras abas: só remove a própria se já existir (permite multi-aba)
+local oldPage = tela:FindFirstChild("Page_PUBLICO")
+if oldPage then oldPage:Destroy() end
+-- limpa overlays antigos desta aba (ex: confirm delete)
+for _, c in ipairs(tela:GetChildren()) do
+	if c.Name == "ConfirmDelete" and "Page_PUBLICO" == "Page_PERFIL" then
+		c:Destroy()
+	end
+end
+
+local function showThisPage(pg)
+	for _, c in ipairs(tela:GetChildren()) do
+		if c:IsA("ScrollingFrame") or (c:IsA("Frame") and tostring(c.Name):sub(1,5) == "Page_") then
+			c.Visible = false
+		end
+	end
+	if pg then
+		pg.Visible = true
+		if applyThemeToPage then applyThemeToPage(pg) end
+	end
+end
+
+
+-- ====================== ESTILOS COMPACTOS ======================
+local STYLES = {
+	BgColor = Color3.fromRGB(10, 10, 12),
+	CardColor = Color3.fromRGB(18, 18, 22),
+	StrokeColor = Color3.fromRGB(0, 140, 255),
+	TextColor = Color3.fromRGB(245, 245, 255),
+	AccentColor = Color3.fromRGB(0, 100, 220),
+	GreenColor = Color3.fromRGB(40, 180, 80),
+	RedColor = Color3.fromRGB(180, 40, 40),
+	HoloColor = Color3.fromRGB(0, 220, 255),
+	SelectNeon = Color3.fromRGB(255, 220, 50)
+}
+
+-- ====================== TEMA COMPARTILHADO (lê do Perfil) ======================
+local CONFIG_FILE = "Abyss_PerfilConfig.json"
+currentFont = Enum.Font.SourceSansBold
+
+function loadSharedTheme()
+	if not readfile or not isfile or not isfile(CONFIG_FILE) then return end
+	local ok, raw = pcall(function() return readfile(CONFIG_FILE) end)
+	if not ok or not raw or raw == "" then return end
+	local HS = game:GetService("HttpService")
+	local ok2, data = pcall(function() return HS:JSONDecode(raw) end)
+	if not ok2 or type(data) ~= "table" then return end
+	if type(data.CardColor) == "table" then
+		STYLES.CardColor = Color3.new(data.CardColor[1] or 0.07, data.CardColor[2] or 0.07, data.CardColor[3] or 0.09)
+	end
+	if type(data.StrokeColor) == "table" then
+		STYLES.StrokeColor = Color3.new(data.StrokeColor[1] or 0, data.StrokeColor[2] or 0.55, data.StrokeColor[3] or 1)
+	end
+	if type(data.TextColor) == "table" then
+		STYLES.TextColor = Color3.new(data.TextColor[1] or 0.96, data.TextColor[2] or 0.96, data.TextColor[3] or 1)
+	end
+	if type(data.BgColor) == "table" and STYLES.BgColor then
+		STYLES.BgColor = Color3.new(data.BgColor[1] or 0.04, data.BgColor[2] or 0.04, data.BgColor[3] or 0.05)
+	end
+	local fonts = {
+		Enum.Font.SourceSans, Enum.Font.SourceSansBold, Enum.Font.Gotham,
+		Enum.Font.GothamBold, Enum.Font.Code, Enum.Font.Ubuntu
+	}
+	if type(data.fontIdx) == "number" and fonts[data.fontIdx] then
+		currentFont = fonts[data.fontIdx]
+	end
+end
+
+function applyThemeToPage(pg)
+	if not pg then return end
+	loadSharedTheme()
+	for _, desc in ipairs(pg:GetDescendants()) do
+		if desc:IsA("TextLabel") or desc:IsA("TextButton") or desc:IsA("TextBox") then
+			desc.TextColor3 = STYLES.TextColor
+			desc.Font = currentFont
+			-- border stroke
+			for _, child in ipairs(desc:GetChildren()) do
+				if child:IsA("UIStroke") and child.ApplyStrokeMode == Enum.ApplyStrokeMode.Border then
+					child.Color = STYLES.StrokeColor
+				end
+			end
+		elseif desc:IsA("UIStroke") and desc.ApplyStrokeMode == Enum.ApplyStrokeMode.Border then
+			desc.Color = STYLES.StrokeColor
+		elseif desc:IsA("ScrollingFrame") then
+			desc.ScrollBarImageColor3 = STYLES.StrokeColor
+		end
+		if (desc:IsA("TextButton") or desc:IsA("TextBox") or desc:IsA("Frame")) and desc.BackgroundTransparency < 0.5 then
+			if desc.Name ~= "ListContainer" and desc.Name ~= "ConfirmDelete" then
+				-- só troca se for cor de card (não botões de ação coloridos)
+				local c = desc.BackgroundColor3
+				local isAction = (c.G > 0.5 and c.R < 0.5) or (c.R > 0.5 and c.G < 0.5) -- verde/vermelho approx
+				if not isAction then
+					desc.BackgroundColor3 = STYLES.CardColor
+				end
+			end
+		end
+	end
+end
+
+
+local OwnerName = LP.Name
+
+-- ====================== ESTADO ROBÔ / MARTELO ======================
+local RH = {
+	mode = "idle",
+	parts = {},
+	con = nil,
+	syncCon = nil,
+	_gen = 0,
+	baseScale = 5.0,
+	offsetY = 16,
+	offsetZ = -9,
+	hammerScale = 1.0,
+	handBone = "RightHand",
+	gripY = 0,
+	spawnProgress = {current=0, total=0, running=false},
+}
+
+local PROP_NAME_RH = "PowerTurbine"
+local PROP_CAT_RH  = "Barrel"
+local PROP_FILTER_RH = "Work"
+local SPAWN_DELAY_RH = 1.0
+local SPAWN_GRID_ROW = 5
+local STAND_UP = CFrame.Angles(math.rad(-90), 0, 0)
+local LAY_DOWN = CFrame.Angles(math.rad(-90), 0, math.rad(90))
+
+local ROBOT_BODY = {
+	{key="head",  ref="Head",           r6="Head"},
+	{key="chest", ref="UpperTorso",     r6="Torso"},
+	{key="hips",  ref="LowerTorso",     r6="Torso"},
+	{key="larm",  ref="LeftUpperArm",   r6="Left Arm"},
+	{key="lfore", ref="LeftLowerArm",   r6="Left Arm"},
+	{key="lhand", ref="LeftHand",       r6="Left Arm"},
+	{key="rarm",  ref="RightUpperArm",  r6="Right Arm"},
+	{key="rfore", ref="RightLowerArm",  r6="Right Arm"},
+	{key="rhand", ref="RightHand",      r6="Right Arm"},
+	{key="lleg",  ref="LeftUpperLeg",   r6="Left Leg"},
+	{key="lshin", ref="LeftLowerLeg",   r6="Left Leg"},
+	{key="lfoot", ref="LeftFoot",       r6="Left Leg"},
+	{key="rleg",  ref="RightUpperLeg",  r6="Right Leg"},
+	{key="rshin", ref="RightLowerLeg",  r6="Right Leg"},
+	{key="rfoot", ref="RightFoot",      r6="Right Leg"},
+}
+
+local HAMMER_BODY = {
+	{key="h1", off=Vector3.new(0, -4.5, 0)},
+	{key="h2", off=Vector3.new(0, -1.5, 0)},
+	{key="h3", off=Vector3.new(0,  1.5, 0)},
+	{key="h4", off=Vector3.new(0,  4.5, 0)},
+	{key="h5", off=Vector3.new(0,  7.5, 0)},
+	{key="h6", off=Vector3.new(0, 10.5, 0)},
+	{key="k1",  off=Vector3.new(-4.5, 14.5,  2.0)},
+	{key="k2",  off=Vector3.new(-1.5, 14.5,  2.0)},
+	{key="k3",  off=Vector3.new( 1.5, 14.5,  2.0)},
+	{key="k4",  off=Vector3.new( 4.5, 14.5,  2.0)},
+	{key="k5",  off=Vector3.new(-4.5, 14.5,  0)},
+	{key="k6",  off=Vector3.new(-1.5, 14.5,  0)},
+	{key="k7",  off=Vector3.new( 1.5, 14.5,  0)},
+	{key="k8",  off=Vector3.new( 4.5, 14.5,  0)},
+	{key="k9",  off=Vector3.new(-4.5, 14.5, -2.0)},
+	{key="k10", off=Vector3.new(-1.5, 14.5, -2.0)},
+	{key="k11", off=Vector3.new( 1.5, 14.5, -2.0)},
+	{key="k12", off=Vector3.new( 4.5, 14.5, -2.0)},
+	{key="c1", off=Vector3.new(-3.0, 18.5, 0)},
+	{key="c2", off=Vector3.new( 3.0, 18.5, 0)},
+}
+
+-- ====================== HELPERS RH ======================
+local function rh_getChar() return LP.Character end
+
+local function rh_obterChaoInfo(pos)
+	local rp = RaycastParams.new()
+	rp.FilterDescendantsInstances = {LP.Character}
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = workspace:Raycast(pos + Vector3.new(0,10,0), Vector3.new(0,-30,0), rp)
+	if hit then return hit.Position, hit.Instance end
+	return pos - Vector3.new(0,3,0), workspace.Terrain
+end
+
+local function rh_pegarMeusProps()
+	local out = {}
+	local wsc = workspace:FindFirstChild("WorkspaceCom")
+	if not wsc then return out end
+	local function scan(p)
+		for _, c in ipairs(p:GetChildren()) do
+			if c:IsA("Model") and c.Name:sub(1, #("Prop"..OwnerName)) == ("Prop"..OwnerName) then
+				table.insert(out, c)
+			end
+			scan(c)
+		end
+	end
+	scan(wsc)
+	return out
+end
+
+local function rh_getGridPosition(index)
+	local char = rh_getChar()
+	if not char then return nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+	local row = math.floor((index - 1) / SPAWN_GRID_ROW)
+	local col = (index - 1) % SPAWN_GRID_ROW
+	local xOffset = (col - 2) * 6
+	local zOffset = 8 + row * 6
+	local basePos = hrp.Position + hrp.CFrame.LookVector * zOffset + hrp.CFrame.RightVector * xOffset
+	return rh_obterChaoInfo(basePos)
+end
+
+local function rh_spawnPropAt(posChao, chaoPart)
+	local char = rh_getChar()
+	if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+	local bp = LP:FindFirstChild("Backpack")
+	local pm = char:FindFirstChild("PropMaker") or (bp and bp:FindFirstChild("PropMaker"))
+	if not pm then return nil end
+	if pm.Parent ~= char then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(function() hum:EquipTool(pm) end)
+		end
+		for _ = 1, 30 do
+			task.wait(0.05)
+			if char:FindFirstChild("PropMaker") then break end
+		end
+		if not char:FindFirstChild("PropMaker") then
+			pcall(function() pm.Parent = char end)
+			task.wait(0.15)
+		end
+	end
+	local tool = char:FindFirstChild("PropMaker")
+	if not tool then return nil end
+	local tmake = tool:FindFirstChild("Tool_PropMake")
+	if not tmake then return nil end
+	local antigos = rh_pegarMeusProps()
+	pcall(function()
+		ReplicatedStorage.Remotes.TelemetryClientInteraction:FireServer("filterClick", {
+			["name"] = PROP_NAME_RH, ["itemType"] = "Props", ["filter"] = PROP_FILTER_RH,
+		})
+	end)
+	task.wait(0.08)
+	local RE = ReplicatedStorage:FindFirstChild("RE")
+	if RE then
+		local cr = RE:FindFirstChild("1Clea1rTool1s")
+		if cr then
+			pcall(function() cr:FireServer("RequestingPropName", PROP_NAME_RH, PROP_CAT_RH, PROP_FILTER_RH) end)
+		end
+	end
+	task.wait(0.15)
+	pcall(function() tmake:FireServer(chaoPart or workspace.Terrain, posChao) end)
+	task.wait(0.7)
+	local atuais = rh_pegarMeusProps()
+	local novo
+	for _, p in ipairs(atuais) do
+		if not table.find(antigos, p) then novo = p break end
+	end
+	if not novo and #atuais > #antigos then novo = atuais[#atuais] end
+	if novo then
+		pcall(function() novo:PivotTo(CFrame.new(posChao)) end)
+		return novo
+	end
+	return nil
+end
+
+local function rh_alinharPivot(prop)
+	local ok, bbCF = pcall(function() return prop:GetBoundingBox() end)
+	if ok and bbCF then prop.WorldPivot = CFrame.new(bbCF.Position) end
+end
+
+local function rh_getRefPart(char, name, r6name)
+	if not char then return nil end
+	local p = char:FindFirstChild(name)
+	if p then return p end
+	if r6name then p = char:FindFirstChild(r6name) end
+	return p
+end
+
+local function rh_getSetCF(prop)
+	if not prop then return nil, nil end
+	local s = prop:FindFirstChild("SetCurrentCFrame")
+	if not s then
+		for _, d in ipairs(prop:GetDescendants()) do
+			if d.Name == "SetCurrentCFrame" then s = d break end
+		end
+	end
+	if not s then return nil, nil end
+	if s:IsA("RemoteFunction") then return s, "function" end
+	if s:IsA("RemoteEvent") then return s, "event" end
+	if s:IsA("BindableFunction") then return s, "bindablefunc" end
+	if s:IsA("BindableEvent") then return s, "bindableev" end
+	return s, "unknown"
+end
+
+local function rh_destruir()
+	RH._gen = (RH._gen or 0) + 1
+	RH.mode = "idle"
+	RH.parts = {}
+	RH.spawnProgress.running = false
+	if RH.con then pcall(function() RH.con:Disconnect() end) RH.con = nil end
+	if RH.syncCon then pcall(function() task.cancel(RH.syncCon) end) RH.syncCon = nil end
+	pcall(function()
+		local RE = ReplicatedStorage:FindFirstChild("RE")
+		if RE and RE:FindFirstChild("1Clea1rTool1s") then
+			RE["1Clea1rTool1s"]:FireServer("ClearAllProps")
+		end
+	end)
+end
+
+-- Loop visual (PivotTo local + guarda _finalCF) — SEM isCharacterOrPlayer (bug corrigido)
+local function rh_ativarLoop()
+	if RH.con then RH.con:Disconnect() end
+	local gen = (RH._gen or 0) + 1
+	RH._gen = gen
+	RH.con = RS.PreRender:Connect(function()
+		if RH.mode == "idle" or RH._gen ~= gen then return end
+		local char = rh_getChar()
+		if not char then return end
+		if RH.mode == "robot" then
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+			local hrpCF = hrp.CFrame
+			local baseCF = hrpCF + Vector3.new(0, RH.offsetY, RH.offsetZ)
+			for _, item in ipairs(RH.parts) do
+				local p = item.prop
+				local refPart = rh_getRefPart(char, item.ref, item.r6)
+				if p and p.Parent and refPart then
+					local relCF = hrpCF:ToObjectSpace(refPart.CFrame)
+					local scaledPos = relCF.Position * RH.baseScale
+					local scaledRot = relCF - relCF.Position
+					local finalCF = baseCF * CFrame.new(scaledPos) * STAND_UP * scaledRot
+					item._finalCF = finalCF
+					pcall(function() p:PivotTo(finalCF) end)
+				end
+			end
+		elseif RH.mode == "hammer" then
+			local hand = char:FindFirstChild(RH.handBone)
+			if not hand then return end
+			local handCF = hand.CFrame
+			for _, item in ipairs(RH.parts) do
+				local p = item.prop
+				if p and p.Parent then
+					local off = item.off * RH.hammerScale + Vector3.new(0, RH.gripY, 0)
+					local finalCF = handCF * CFrame.new(off) * LAY_DOWN
+					item._finalCF = finalCF
+					pcall(function() p:PivotTo(finalCF) end)
+				end
+			end
+		end
+	end)
+end
+
+-- Sync de remotes separado (~30ms)
+local function rh_ativarSync()
+	local gen = RH._gen
+	if RH.syncCon then pcall(function() task.cancel(RH.syncCon) end) end
+	RH.syncCon = task.spawn(function()
+		while RH.mode ~= "idle" and RH._gen == gen do
+			for _, item in ipairs(RH.parts) do
+				if RH.mode == "idle" or RH._gen ~= gen then return end
+				if item.setCF and item._finalCF then
+					local remote = item.setCF
+					local cf = item._finalCF
+					local tipo = item.cfType
+					task.spawn(function()
+						if tipo == "function" or tipo == "bindablefunc" then
+							pcall(function() remote:InvokeServer(cf) end)
+						elseif tipo == "event" then
+							pcall(function() remote:FireServer(cf) end)
+						elseif tipo == "bindableev" then
+							pcall(function() remote:Fire(cf) end)
+						else
+							local ok = pcall(function() remote:InvokeServer(cf) end)
+							if not ok then pcall(function() remote:FireServer(cf) end) end
+						end
+					end)
+				end
+			end
+			task.wait(0.03)
+		end
+	end)
+end
+
+local function rh_spawnRobot()
+	if RH.mode ~= "idle" then rh_destruir(); task.wait(0.3) end
+	if RH.spawnProgress.running then return end
+	RH.mode = "robot"
+	RH.parts = {}
+	RH.spawnProgress.running = true
+	RH.spawnProgress.current = 0
+	RH.spawnProgress.total = #ROBOT_BODY
+	if updateRHStatus then updateRHStatus() end
+	task.spawn(function()
+		local ok_count = 0
+		for i, def in ipairs(ROBOT_BODY) do
+			if not RH.spawnProgress.running or RH.mode ~= "robot" then break end
+			RH.spawnProgress.current = i
+			if updateRHStatus then updateRHStatus() end
+			local posChao, chaoPart = rh_getGridPosition(i)
+			if not posChao then break end
+			local prop = rh_spawnPropAt(posChao, chaoPart)
+			if prop then
+				for _, d in ipairs(prop:GetDescendants()) do
+					if d:IsA("BasePart") then
+						pcall(function()
+							d.Anchored = true; d.CanCollide = false
+							d.CanTouch = false; d.CanQuery = false
+							d.Massless = true; d.Material = Enum.Material.SmoothPlastic
+						end)
+					end
+				end
+				rh_alinharPivot(prop)
+				local setCF, tipo = rh_getSetCF(prop)
+				table.insert(RH.parts, {
+					prop = prop, ref = def.ref, r6 = def.r6, key = def.key,
+					setCF = setCF, cfType = tipo, isRobot = true,
+				})
+				ok_count = ok_count + 1
+			end
+			if i < #ROBOT_BODY then task.wait(SPAWN_DELAY_RH) end
+		end
+		RH.spawnProgress.running = false
+		if ok_count > 0 then
+			rh_ativarLoop()
+			rh_ativarSync()
+		else
+			RH.mode = "idle"
+		end
+		if updateRHStatus then updateRHStatus() end
+	end)
+end
+
+local function rh_spawnHammer()
+	if RH.mode ~= "idle" then rh_destruir(); task.wait(0.3) end
+	if RH.spawnProgress.running then return end
+	RH.mode = "hammer"
+	RH.parts = {}
+	RH.spawnProgress.running = true
+	RH.spawnProgress.current = 0
+	RH.spawnProgress.total = #HAMMER_BODY
+	if updateRHStatus then updateRHStatus() end
+	task.spawn(function()
+		local ok_count = 0
+		for i, def in ipairs(HAMMER_BODY) do
+			if not RH.spawnProgress.running or RH.mode ~= "hammer" then break end
+			RH.spawnProgress.current = i
+			if updateRHStatus then updateRHStatus() end
+			local posChao, chaoPart = rh_getGridPosition(i)
+			if not posChao then break end
+			local prop = rh_spawnPropAt(posChao, chaoPart)
+			if prop then
+				for _, d in ipairs(prop:GetDescendants()) do
+					if d:IsA("BasePart") then
+						pcall(function()
+							d.Anchored = true; d.CanCollide = false
+							d.CanTouch = false; d.CanQuery = false
+							d.Massless = true; d.Material = Enum.Material.SmoothPlastic
+						end)
+					end
+				end
+				rh_alinharPivot(prop)
+				local setCF, tipo = rh_getSetCF(prop)
+				table.insert(RH.parts, {
+					prop = prop, off = def.off, setCF = setCF, cfType = tipo, isHammer = true, key = def.key,
+				})
+				ok_count = ok_count + 1
+			end
+			if i < #HAMMER_BODY then task.wait(SPAWN_DELAY_RH) end
+		end
+		RH.spawnProgress.running = false
+		if ok_count > 0 then
+			rh_ativarLoop()
+			rh_ativarSync()
+		else
+			RH.mode = "idle"
+		end
+		if updateRHStatus then updateRHStatus() end
+	end)
+end
+
+-- ====================== UI COMPACTA (só a aba Extras) ======================
+local CONTENT_WIDTH = 0.90
+local BTN_H = 20
+local BTN_H_SM = 17
+local PAD_Y = 3
+
+local function applyStyle(inst, cornerRadius, hasStroke, strokeColor)
+	if cornerRadius then
+		local corner = inst:FindFirstChildOfClass("UICorner") or Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, cornerRadius)
+		corner.Parent = inst
+	end
+	if hasStroke then
+		local stroke = inst:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke")
+		stroke.Color = strokeColor or STYLES.StrokeColor
+		stroke.Thickness = 1
+		stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		stroke.Parent = inst
+	end
+end
+
+local function createStyledBtn(text, parent, height, strokeColor)
+	height = height or BTN_H
+	local btn = Instance.new("TextButton")
+	btn.Text = text
+	btn.Size = UDim2.new(CONTENT_WIDTH, 0, 0, height)
+	btn.BackgroundColor3 = STYLES.CardColor
+	btn.TextColor3 = STYLES.TextColor
+	btn.Font = Enum.Font.SourceSansBold
+	btn.TextSize = 10
+	btn.TextWrapped = true
+	btn.AutoButtonColor = true
+	btn.Parent = parent
+	applyStyle(btn, 4, true, strokeColor)
+	return btn
+end
+
+local function createLabel(text, parent, height, fontSize)
+	local lbl = Instance.new("TextLabel")
+	lbl.Text = text
+	lbl.Size = UDim2.new(CONTENT_WIDTH, 0, 0, height or 14)
+	lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = STYLES.TextColor
+	lbl.Font = Enum.Font.SourceSans
+	lbl.TextSize = fontSize or 10
+	lbl.TextWrapped = true
+	lbl.TextXAlignment = Enum.TextXAlignment.Center
+	lbl.Parent = parent
+	return lbl
+end
+
+-- Página única (Extras)
+local page = Instance.new("ScrollingFrame")
+page.Name = "Page_PUBLICO"
+page.Size = UDim2.new(1, -10, 1, -28)
+page.Position = UDim2.new(0, 5, 0, 22)
+page.BackgroundTransparency = 1
+page.BorderSizePixel = 0
+page.ScrollBarThickness = 3
+page.ScrollBarImageColor3 = STYLES.StrokeColor
+page.CanvasSize = UDim2.new(0, 0, 0, 0)
+page.Visible = true
+page.Parent = tela
+showThisPage(page)
+
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 2)
+pad.PaddingBottom = UDim.new(0, 8)
+pad.PaddingLeft = UDim.new(0, 6)
+pad.PaddingRight = UDim.new(0, 6)
+pad.Parent = page
+
+local layout = Instance.new("UIListLayout")
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, PAD_Y)
+layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+layout.VerticalAlignment = Enum.VerticalAlignment.Top
+layout.Parent = page
+
+layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	page.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 12)
+end)
+
+-- Status
+local rhStatusLbl = Instance.new("TextLabel")
+rhStatusLbl.Text = "🔍 Inativo"
+rhStatusLbl.Size = UDim2.new(CONTENT_WIDTH, 0, 0, 18)
+rhStatusLbl.BackgroundColor3 = STYLES.CardColor
+rhStatusLbl.TextColor3 = STYLES.TextColor
+rhStatusLbl.Font = Enum.Font.SourceSansBold
+rhStatusLbl.TextSize = 9
+rhStatusLbl.Parent = page
+applyStyle(rhStatusLbl, 4, true)
+
+function updateRHStatus()
+	if RH.spawnProgress.running then
+		rhStatusLbl.Text = ("⏳ %s: %d/%d"):format(
+			RH.mode == "robot" and "ROBÔ" or "MARTELO",
+			RH.spawnProgress.current, RH.spawnProgress.total)
+		rhStatusLbl.TextColor3 = STYLES.SelectNeon
+	elseif RH.mode == "robot" then
+		rhStatusLbl.Text = ("🤖 ROBÔ ATIVO • %d props"):format(#RH.parts)
+		rhStatusLbl.TextColor3 = STYLES.GreenColor
+	elseif RH.mode == "hammer" then
+		rhStatusLbl.Text = ("🔨 MARTELO ATIVO • %d props"):format(#RH.parts)
+		rhStatusLbl.TextColor3 = STYLES.HoloColor
+	else
+		rhStatusLbl.Text = "🔍 Inativo"
+		rhStatusLbl.TextColor3 = STYLES.TextColor
+	end
+end
+
+local SpawnRobotBtn = createStyledBtn("▶ SPAWNAR ROBÔ (~15s)", page, BTN_H, STYLES.AccentColor)
+SpawnRobotBtn.MouseButton1Click:Connect(function()
+	if RH.mode == "robot" then
+		rh_destruir()
+		SpawnRobotBtn.Text = "▶ SPAWNAR ROBÔ (~15s)"
+		SpawnRobotBtn.BackgroundColor3 = STYLES.AccentColor
+	else
+		rh_spawnRobot()
+		SpawnRobotBtn.Text = "🗑 CANCELAR ROBÔ"
+		SpawnRobotBtn.BackgroundColor3 = STYLES.RedColor
+	end
+	updateRHStatus()
+end)
+
+local SpawnHammerBtn = createStyledBtn("▶ SPAWNAR MARTELO (~20s)", page, BTN_H, STYLES.SelectNeon)
+SpawnHammerBtn.MouseButton1Click:Connect(function()
+	if RH.mode == "hammer" then
+		rh_destruir()
+		SpawnHammerBtn.Text = "▶ SPAWNAR MARTELO (~20s)"
+		SpawnHammerBtn.BackgroundColor3 = STYLES.SelectNeon
+	else
+		rh_spawnHammer()
+		SpawnHammerBtn.Text = "🗑 CANCELAR MARTELO"
+		SpawnHammerBtn.BackgroundColor3 = STYLES.RedColor
+	end
+	updateRHStatus()
+end)
+
+local DestroyRHBtn = createStyledBtn("🗑 DESTRUIR / LIMPAR", page, BTN_H_SM, STYLES.RedColor)
+DestroyRHBtn.MouseButton1Click:Connect(function()
+	rh_destruir()
+	SpawnRobotBtn.Text = "▶ SPAWNAR ROBÔ (~15s)"
+	SpawnRobotBtn.BackgroundColor3 = STYLES.AccentColor
+	SpawnHammerBtn.Text = "▶ SPAWNAR MARTELO (~20s)"
+	SpawnHammerBtn.BackgroundColor3 = STYLES.SelectNeon
+	updateRHStatus()
+end)
+
+createLabel("ESCALA / OFFSET", page, 12, 8)
+
+local scaleRow = Instance.new("Frame")
+scaleRow.Size = UDim2.new(CONTENT_WIDTH, 0, 0, 16)
+scaleRow.BackgroundTransparency = 1
+scaleRow.Parent = page
+
+local function makeMiniBtn(text, xScale, parent, color, cb)
+	local b = Instance.new("TextButton")
+	b.Text = text
+	b.Size = UDim2.new(0.22, 0, 1, 0)
+	b.Position = UDim2.new(xScale, 0, 0, 0)
+	b.BackgroundColor3 = color or STYLES.CardColor
+	b.TextColor3 = STYLES.TextColor
+	b.Font = Enum.Font.SourceSansBold
+	b.TextSize = 8
+	b.Parent = parent
+	applyStyle(b, 3, true)
+	b.MouseButton1Click:Connect(cb)
+	return b
+end
+
+local scaleValLbl = Instance.new("TextLabel")
+scaleValLbl.Text = "Esc:5.0"
+scaleValLbl.Size = UDim2.new(0.28, 0, 1, 0)
+scaleValLbl.Position = UDim2.new(0.24, 0, 0, 0)
+scaleValLbl.BackgroundTransparency = 1
+scaleValLbl.TextColor3 = STYLES.TextColor
+scaleValLbl.Font = Enum.Font.SourceSansBold
+scaleValLbl.TextSize = 8
+scaleValLbl.Parent = scaleRow
+
+makeMiniBtn("−Esc", 0, scaleRow, STYLES.RedColor, function()
+	RH.baseScale = math.max(1, RH.baseScale - 0.5)
+	scaleValLbl.Text = ("Esc:%.1f"):format(RH.baseScale)
+end)
+makeMiniBtn("+Esc", 0.52, scaleRow, STYLES.GreenColor, function()
+	RH.baseScale = math.min(15, RH.baseScale + 0.5)
+	scaleValLbl.Text = ("Esc:%.1f"):format(RH.baseScale)
+end)
+makeMiniBtn("Mão", 0.76, scaleRow, STYLES.AccentColor, function()
+	RH.handBone = (RH.handBone == "RightHand") and "LeftHand" or "RightHand"
+end)
+
+local offsetRow = Instance.new("Frame")
+offsetRow.Size = UDim2.new(CONTENT_WIDTH, 0, 0, 16)
+offsetRow.BackgroundTransparency = 1
+offsetRow.Parent = page
+
+local offYLbl = Instance.new("TextLabel")
+offYLbl.Text = "Y:16"
+offYLbl.Size = UDim2.new(0.22, 0, 1, 0)
+offYLbl.Position = UDim2.new(0.24, 0, 0, 0)
+offYLbl.BackgroundTransparency = 1
+offYLbl.TextColor3 = STYLES.TextColor
+offYLbl.Font = Enum.Font.SourceSansBold
+offYLbl.TextSize = 8
+offYLbl.Parent = offsetRow
+
+makeMiniBtn("−Y", 0, offsetRow, STYLES.RedColor, function()
+	RH.offsetY = RH.offsetY - 1
+	offYLbl.Text = "Y:" .. RH.offsetY
+end)
+makeMiniBtn("+Y", 0.48, offsetRow, STYLES.GreenColor, function()
+	RH.offsetY = RH.offsetY + 1
+	offYLbl.Text = "Y:" .. RH.offsetY
+end)
+
+local offZLbl = Instance.new("TextLabel")
+offZLbl.Text = "Z:-9"
+offZLbl.Size = UDim2.new(0.22, 0, 1, 0)
+offZLbl.Position = UDim2.new(0.76, 0, 0, 0)
+offZLbl.BackgroundTransparency = 1
+offZLbl.TextColor3 = STYLES.TextColor
+offZLbl.Font = Enum.Font.SourceSansBold
+offZLbl.TextSize = 8
+offZLbl.Parent = offsetRow
+
+local gripRow = Instance.new("Frame")
+gripRow.Size = UDim2.new(CONTENT_WIDTH, 0, 0, 16)
+gripRow.BackgroundTransparency = 1
+gripRow.Parent = page
+
+makeMiniBtn("−Z", 0, gripRow, STYLES.RedColor, function()
+	RH.offsetZ = RH.offsetZ - 1
+	offZLbl.Text = "Z:" .. RH.offsetZ
+end)
+makeMiniBtn("+Z", 0.24, gripRow, STYLES.GreenColor, function()
+	RH.offsetZ = RH.offsetZ + 1
+	offZLbl.Text = "Z:" .. RH.offsetZ
+end)
+
+local gripLbl = Instance.new("TextLabel")
+gripLbl.Text = "Grip:0"
+gripLbl.Size = UDim2.new(0.22, 0, 1, 0)
+gripLbl.Position = UDim2.new(0.50, 0, 0, 0)
+gripLbl.BackgroundTransparency = 1
+gripLbl.TextColor3 = STYLES.TextColor
+gripLbl.Font = Enum.Font.SourceSansBold
+gripLbl.TextSize = 8
+gripLbl.Parent = gripRow
+
+makeMiniBtn("−G", 0.72, gripRow, STYLES.RedColor, function()
+	RH.gripY = RH.gripY - 0.5
+	gripLbl.Text = ("Grip:%.1f"):format(RH.gripY)
+end)
+makeMiniBtn("+G", 0.88, gripRow, STYLES.GreenColor, function()
+	RH.gripY = RH.gripY + 0.5
+	gripLbl.Text = ("Grip:%.1f"):format(RH.gripY)
+end)
+
+createLabel("Robô = 15 props | Martelo = 20 props\n(Aba Extras isolada)", page, 20, 8)
+
+-- Conecta só a aba de extras do DIE (opcional, para quando clicar nela)
+local function getHitbox(abaName)
+	local aba = base:FindFirstChild(abaName)
+	if aba then return aba:FindFirstChild("Hitbox") end
+	return nil
+end
+
+local hitExtra = getHitbox("aba de extras")
+if hitExtra then
+	hitExtra.MouseButton1Click:Connect(function()
+		showThisPage(page)
+	end)
+end
+
+-- Já mostra a página ao executar
+showThisPage(page)
+
+if page then applyThemeToPage(page) end
+print("Abyss DIE — Apenas Aba Extras (Robô + Martelo) carregada")
